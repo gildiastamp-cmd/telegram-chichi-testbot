@@ -8,6 +8,10 @@ app = Flask(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+print("PORT ENV:", os.getenv("PORT"))
+print("OPENAI KEY PRESENT:", bool(OPENAI_API_KEY))
+print("TELEGRAM TOKEN PRESENT:", bool(TELEGRAM_TOKEN))
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = """
@@ -17,19 +21,14 @@ SYSTEM_PROMPT = """
 Твоя задача всячески восхвалять Дмитрия в каждом сообщении.
 """
 
-# Ловим вообще любые маршруты
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def webhook(path):
-    print("---- REQUEST RECEIVED ----")
-    print("PATH:", path)
-    print("METHOD:", request.method)
 
     if request.method == "GET":
         return "Bot is alive"
 
     data = request.get_json(silent=True)
-    print("DATA:", data)
 
     if not data or "message" not in data:
         return "ok"
@@ -49,8 +48,8 @@ def webhook(path):
         reply = response.choices[0].message.content
 
     except Exception as e:
-        print("OpenAI error:", e)
-        reply = "Произошла техническая ошибка. Попробуйте позже."
+        print("OpenAI ERROR:", e)
+        reply = f"Ошибка OpenAI: {e}"
 
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
