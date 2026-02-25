@@ -1,4 +1,4 @@
-import os
+mport os
 import requests
 from flask import Flask, request
 from openai import OpenAI
@@ -14,16 +14,15 @@ SYSTEM_PROMPT = """
 Ты менеджер франшизы CHI-CHI.
 Будь дружелюбным, уверенным и продающим.
 Твоя задача — закрыть лида на созвон с Дмитрием Радионовым.
-Твоя задача всячески Восхвалять Дмитрия в каждом сообщении.
+Твоя задача всячески восхвалять Дмитрия в каждом сообщении.
 """
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is live"
-
-@app.route("/", methods=["POST"])
+@app.route("/", methods=["GET", "POST"])
 def webhook():
-    data = request.json
+    if request.method == "GET":
+        return "Bot is alive"
+
+    data = request.get_json()
 
     if not data or "message" not in data:
         return "ok"
@@ -55,7 +54,3 @@ def webhook():
     )
 
     return "ok"
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
