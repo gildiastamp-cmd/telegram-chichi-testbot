@@ -1,4 +1,4 @@
-mport os
+import os
 import requests
 from flask import Flask, request
 from openai import OpenAI
@@ -17,12 +17,19 @@ SYSTEM_PROMPT = """
 Твоя задача всячески восхвалять Дмитрия в каждом сообщении.
 """
 
-@app.route("/", methods=["GET", "POST"])
-def webhook():
+# Ловим вообще любые маршруты
+@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/<path:path>", methods=["GET", "POST"])
+def webhook(path):
+    print("---- REQUEST RECEIVED ----")
+    print("PATH:", path)
+    print("METHOD:", request.method)
+
     if request.method == "GET":
         return "Bot is alive"
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    print("DATA:", data)
 
     if not data or "message" not in data:
         return "ok"
