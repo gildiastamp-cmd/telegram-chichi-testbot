@@ -14,7 +14,7 @@ SYSTEM_PROMPT = """
 Закрывай на созвон с Дмитрием Радионовым.
 """
 
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+@app.route("/", methods=["POST"])
 def webhook():
     data = request.json
 
