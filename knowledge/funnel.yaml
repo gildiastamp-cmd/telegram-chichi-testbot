@@ -1,0 +1,15 @@
+stages:
+  - id: new_lead
+    goal: "Первичный контакт"
+    next: qualification
+
+  - id: qualification
+    goal: "Город, сроки, бюджет, опыт"
+    next: ready_for_call
+
+  - id: ready_for_call
+    goal: "Предложить созвон"
+    next: call_scheduled
+
+  - id: call_scheduled
+    goal: "Подтвердить время и передать менеджеру"
