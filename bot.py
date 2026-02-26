@@ -134,7 +134,7 @@ async def handle(message: Message):
     new_brief = update_brief(user_text, answer, brief)
     save_brief(user_id, new_brief)
 
-async def main():init_db()
+async def main():init_db():
     bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
     await dp.start_polling(bot)
 
