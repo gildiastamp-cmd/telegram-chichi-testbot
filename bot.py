@@ -253,21 +253,20 @@ async def handle_text(message: Message):
         pass
 
 
-# =================
+# ======================
 # MAIN
-# =================
-
-from aiogram.client.default import DefaultBotProperties
-
-bot = Bot(
-    token=TELEGRAM_BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+# ======================
 
 async def main():
     init_db()
     print("BOT STARTED ✅", flush=True)
+
+    # если у бота когда-то был webhook — удаляем, чтобы polling работал
+    await bot.delete_webhook(drop_pending_updates=True)
+
     await dp.start_polling(bot)
 
-if name == "__main__":
+
+if name__==__"__main__":
+    import asyncio
     asyncio.run(main())
