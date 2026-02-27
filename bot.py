@@ -260,7 +260,12 @@ async def main():
     init_db()
     print("BOT STARTED ✅", flush=True)
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN, parse_mode=ParseMode.HTML)
+    from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(
+    token=TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
     await dp.start_polling(bot)
 
 
