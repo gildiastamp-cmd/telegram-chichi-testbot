@@ -1,6 +1,6 @@
 exception("Failed to send finmodel: %s", e)
 
-    if not sent_any:
+if not sent_any:
         await message.answer(
             "Не нашла файлы в репозитории. Проверь пути:\n"
             "knowledge/assets/deck_main.pdf\n"
