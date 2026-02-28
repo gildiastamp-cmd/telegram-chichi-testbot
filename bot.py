@@ -1,4 +1,149 @@
-"knowledge/assets/financial_model.xlsx"
+import os
+import asyncio
+import logging
+from pathlib import Path
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import FSInputFile
+
+import asyncpg
+
+# Optional OpenAI (если ключ не задан — бот будет отвечать без ИИ)
+try:
+    from openai import AsyncOpenAI
+except Exception:
+    AsyncOpenAI = None  # type: ignore
+
+
+# --------------------
+# CONFIG
+# --------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "knowledge" / "assets"
+DECK_PATH = ASSETS_DIR / "deck_main.pdf"
+FINMODEL_PATH = ASSETS_DIR / "financial_model.xlsx"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("bot")
+
+router = Router()
+
+_pool: Optional[asyncpg.Pool] = None
+_openai_client: Optional["AsyncOpenAI"] = None
+
+
+# --------------------
+# DB
+# --------------------
+async def init_db() -> None:
+    global _pool
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is empty. DB features disabled.")
+        return
+
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS leads (
+                user_id BIGINT PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+    logger.info("DB initialized")
+
+
+async def db_upsert_lead(message: Message) -> None:
+    if not _pool:
+        return
+    user = message.from_user
+    if not user:
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO leads (user_id, first_name, username)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE
+            SET first_name = EXCLUDED.first_name,
+                username = EXCLUDED.username,
+                updated_at = NOW();
+            """,
+            user.id,
+            user.first_name,
+            user.username,
+        )
+
+
+async def db_save_message(user_id: int, role: str, text: str) -> None:
+    if not _pool:
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO messages (user_id, role, text) VALUES ($1, $2, $3);",
+            user_id,
+            role,
+            text,
+        )
+
+
+# --------------------
+# FILES SENDER
+# --------------------
+async def send_assets_if_exist(message: Message) -> bool:
+    sent_any = False
+
+    # deck
+    if DECK_PATH.exists():
+        try:
+            await message.answer_document(
+                FSInputFile(str(DECK_PATH)),
+                caption="📎 Презентация франшизы (deck_main.pdf)",
+            )
+            sent_any = True
+        except Exception as e:
+            logger.exception("Failed to send deck: %s", e)
+
+    # finmodel
+    if FINMODEL_PATH.exists():
+        try:
+            await message.answer_document(
+                FSInputFile(str(FINMODEL_PATH)),
+                caption="📎 Финмодель (financial_model.xlsx)",
+            )
+            sent_any = True
+        except Exception as e:
+            logger.exception("Failed to send finmodel: %s", e)
+
+    if not sent_any:
+        await message.answer(
+            "Не нашёл файлы в репозитории. Проверь пути:\n"
+            "knowledge/assets/deck_main.pdf\n""knowledge/assets/financial_model.xlsx"
         )
 
     return sent_any
