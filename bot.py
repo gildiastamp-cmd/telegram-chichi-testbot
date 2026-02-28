@@ -178,8 +178,7 @@ async def upsert_lead(
         last_action = EXCLUDED.last_action,
         phone_or_contact = COALESCE(EXCLUDED.phone_or_contact, leads.phone_or_contact),
         calc_payload = COALESCE(EXCLUDED.calc_payload, leads.calc_payload),
-        updated_at = NOW();
-    """
+        updated_at = NOW();"""
     async with _pool.acquire() as conn:
         await conn.execute(
             query,
