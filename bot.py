@@ -1,4 +1,148 @@
-create_index = """
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Optional
+
+import asyncpg
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("iira-bot")
+
+
+# ---------------------------
+# Env
+# ---------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # Railway Postgres URL
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()  # optional (your TG id)
+
+
+# ---------------------------
+# Files
+# ---------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DECK_PATH = os.path.join(BASE_DIR, "knowledge", "deck_main.pdf")
+FINMODEL_PATH = os.path.join(BASE_DIR, "knowledge", "financial_model.xlsx")
+
+# fallback if you store files in root
+if not os.path.exists(DECK_PATH):
+    DECK_PATH = os.path.join(BASE_DIR, "deck_main.pdf")
+if not os.path.exists(FINMODEL_PATH):
+    FINMODEL_PATH = os.path.join(BASE_DIR, "financial_model.xlsx")
+
+
+# ---------------------------
+# Personality / copy (ИИра)
+# ---------------------------
+IIRA_NAME = "ИИра"
+
+HELLO_TEXT = (
+    f"Привет! Я {IIRA_NAME} — личный ИИ-ассистент Дмитрия Родионова.\n\n"
+    "Я могу быстро дать материалы по франшизе и помочь прикинуть цифры под вашу ситуацию.\n"
+    "А если будет интересно — аккуратно организую созвон с Дмитрием 🙂"
+)
+
+AFTER_FILES_TEXT = (
+    "Держи материалы 👇\n\n"
+    "Если хочешь, могу:\n"
+    "• коротко объяснить, чем формат сильнее альтернатив,\n"
+    "• задать 3–4 вопроса и прикинуть персональные цифры,\n"
+    "• или сразу записать на созвон."
+)
+
+SOFT_STYLE_NOTE = (
+    "PS: Я не навязчивая. Сначала — польза. Созвон предложу только если вижу интерес 😉"
+)
+
+
+# ---------------------------
+# UI
+# ---------------------------
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📕 Получить презентацию", callback_data="get_deck")],
+            [InlineKeyboardButton(text="📊 Получить фин. модель", callback_data="get_fin")],
+            [InlineKeyboardButton(text="🧮 Рассчитать персональную фин. модель", callback_data="calc")],
+            [InlineKeyboardButton(text="📞 Назначить созвон с Дмитрием", callback_data="call")],
+        ]
+    )
+
+
+# ---------------------------
+# FSM
+# ---------------------------
+class CalcFlow(StatesGroup):
+    city = State()
+    investment = State()
+    rent = State()
+    contact = State()
+
+
+class CallFlow(StatesGroup):
+    contact = State()
+    time = State()
+
+
+# ---------------------------
+# DB
+# ---------------------------
+_pool: Optional[asyncpg.Pool] = None
+
+
+async def db_connect() -> None:
+    global _pool
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL is empty. Bot will run WITHOUT DB.")
+        _pool = None
+        return
+
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    log.info("DB pool created")
+    await db_init_schema()
+
+
+async def db_init_schema() -> None:
+    """Creates tables/indexes. Safe to run on every boot."""
+    if not _pool:
+        return
+
+    create_leads = """
+    CREATE TABLE IF NOT EXISTS leads (
+        id              BIGSERIAL PRIMARY KEY,
+        tg_user_id      BIGINT NOT NULL,
+        tg_username     TEXT,
+        first_name      TEXT,
+        last_name       TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_action     TEXT,
+        phone_or_contact TEXT,
+        calc_payload    JSONB
+    );
+    """create_index = """
     CREATE UNIQUE INDEX IF NOT EXISTS leads_tg_user_id_uidx
     ON leads (tg_user_id);
     """
@@ -134,10 +278,7 @@ async def cb_get_deck(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "get_fin")
 async def cb_get_fin(call: CallbackQuery) -> None:
-    await call.
-
-
-answer()
+    await call.answer()
     await handle_get_fin(call.message)
 
 
