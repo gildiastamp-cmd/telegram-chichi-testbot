@@ -2,166 +2,161 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from datetime import datetime, timezone
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import Message, FSInputFile
 
-# -------------------- CONFIG --------------------
+
+# -----------------------
+# Config
+# -----------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-ASSETS_DIR = Path(__file__).parent / "knowledge" / "assets"
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "knowledge" / "assets"
 DECK_PATH = ASSETS_DIR / "deck_main.pdf"
-FINMODEL_PATH = ASSETS_DIR / "financial_model.xlsx"
+MODEL_PATH = ASSETS_DIR / "financial_model.xlsx"
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# -------------------- LOGGING -------------------
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("bot")
-
-# -------------------- DB ------------------------
-_pool: Optional[asyncpg.Pool] = None
+logger = logging.getLogger("salesbot")
 
 
-async def get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is empty. Set it in Railway Variables.")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    return _pool
-
-
-async def ensure_schema() -> None:
+# -----------------------
+# DB helpers
+# -----------------------
+async def init_db(conn: asyncpg.Connection) -> None:
     """
-    Делает схему идемпотентной:
-    - создаёт таблицу leads если её нет
-    - добавляет недостающие колонки если таблица уже была создана старой версией
+    1) Создаёт таблицу leads, если её нет
+    2) Если таблица есть, но колонок не хватает — добавляет их
+    (чтобы больше не ловить UndefinedColumnError)
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # 1) Таблица (если нет)
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS leads (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                stage TEXT DEFAULT 'new',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leads (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            source TEXT,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        """
+    )
 
-        # 2) Колонки (если таблица старая)
-        # В Postgres можно безопасно: ADD COLUMN IF NOT EXISTS
-        await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS username TEXT;")
-        await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS first_name TEXT;")
-        await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_name TEXT;")
-        await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS stage TEXT DEFAULT 'new';")
-        await conn.execute(
-            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();"
-        )
-        await conn.execute(
-            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();"
-        )
-
-        # 3) updated_at триггером не усложняем — обновляем вручную в UPSERT
+    # Если таблица была создана раньше в другой версии — мягко докидываем колонки
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS username TEXT;")
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS first_name TEXT;")
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_name TEXT;")
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS source TEXT;")
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();")
+    await conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();")
 
 
-async def upsert_lead(message: Message) -> None:
-    pool = await get_pool()
-    tg = message.from_user
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO leads (telegram_id, username, first_name, last_name, stage)
-            VALUES ($1, $2, $3, $4, 'started')
-            ON CONFLICT (telegram_id) DO UPDATE
-            SET username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                stage = 'started',
-                updated_at = NOW();
-            """,
-            tg.id,
-            tg.username,
-            tg.first_name,
-            tg.last_name,
-        )
+async def upsert_lead(conn: asyncpg.Connection, message: Message, source: str = "telegram") -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    now = datetime.now(timezone.utc)
+    await conn.execute(
+        """
+        INSERT INTO leads (user_id, username, first_name, last_name, source, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $6)
+        ON CONFLICT (user_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            source = EXCLUDED.source,
+            updated_at = EXCLUDED.updated_at;
+        """,
+        user.id,
+        user.username,
+        user.first_name,
+        user.last_name,
+        source,
+        now,
+    )
 
 
-# -------------------- BOT ------------------------
-dp = Dispatcher()
-
-
-async def safe_send_assets(message: Message) -> None:
-    # Отправка файлов — отдельно, чтобы видеть точную причину если файла нет
+# -----------------------
+# Bot logic
+# -----------------------
+async def send_assets(message: Message) -> None:
+    missing = []
     if not DECK_PATH.exists():
-        log.error("Missing file: %s", DECK_PATH)
-        await message.answer("Не нашёл файл презентации на сервере 😕 (deck_main.pdf)")
-    else:
-        await message.answer_document(
-            FSInputFile(str(DECK_PATH)),
-            caption="📄 Презентация франшизы (deck_main.pdf)",
+        missing.append(str(DECK_PATH))
+    if not MODEL_PATH.exists():
+        missing.append(str(MODEL_PATH))
+
+    if missing:
+        await message.answer(
+            "Я запустился, но не нашёл файлы в репозитории:\n"
+            + "\n".join(f"• {p}" for p in missing)
         )
+        return
 
-    if not FINMODEL_PATH.exists():
-        log.error("Missing file: %s", FINMODEL_PATH)
-        await message.answer("Не нашёл файл финмодели на сервере 😕 (financial_model.xlsx)")
-    else:
-        await message.answer_document(
-            FSInputFile(str(FINMODEL_PATH)),
-            caption="📊 Финмодель (financial_model.xlsx)",
-        )
+    await message.answer("Держи материалы 👇")
 
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    # Важно: никогда не молчим — даже если БД упала
-    await message.answer("Привет! Сейчас пришлю презентацию и финмодель 👇")
-
-    try:
-        await upsert_lead(message)
-    except Exception:
-        log.exception("DB error in /start (lead upsert). Continuing anyway...")
-        await message.answer("⚠️ Технический момент: не смог записать данные в базу, но материалы пришлю.")
-
-    try:
-        await safe_send_assets(message)
-    except Exception:
-        log.exception("Asset sending failed")
-        await message.answer("⚠️ Не смог отправить файлы. Проверь, что они есть в repo: knowledge/assets/.")
-
-
-@dp.message(F.text)
-async def any_text(message: Message) -> None:
-    # Минимальная заглушка, чтобы бот не выглядел "мертвым"
-    await message.answer("Я на связи. Напиши /start чтобы получить материалы 🙂")
+    await message.answer_document(
+        FSInputFile(str(DECK_PATH)),
+        caption="Презентация франшизы (deck_main.pdf)",
+    )
+    await message.answer_document(
+        FSInputFile(str(MODEL_PATH)),
+        caption="Финансовая модель (financial_model.xlsx)",
+    )
 
 
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Set it in Railway Variables.")
+        raise RuntimeError("ENV TELEGRAM_BOT_TOKEN is empty")
+    if not DATABASE_URL:
+        raise RuntimeError("ENV DATABASE_URL is empty")
 
-    # 1) Чиним схему до старта polling
-    await ensure_schema()
-    log.info("DB schema ensured.")
-
-    # 2) Стартуем бота
     bot = Bot(token=BOT_TOKEN)
-    log.info("Starting polling...")
-    await dp.start_polling(bot)
+    dp = Dispatcher()
+
+    # создаём одно соединение (для простоты и стабильности)
+    conn = await asyncpg.connect(DATABASE_URL)
+    await init_db(conn)
+    logger.info("DB ready")
+
+    @dp.message(CommandStart())
+    async def cmd_start(message: Message) -> None:try:
+            await upsert_lead(conn, message, source="telegram")
+        except Exception:
+            logger.exception("DB upsert failed on /start")
+        await message.answer("Привет! Я бот по франшизе CHI-CHI. Сейчас пришлю презентацию и финмодель.")
+        await send_assets(message)
+
+    @dp.message(F.text)
+    async def any_text(message: Message) -> None:
+        # Чтобы бот не молчал вообще никогда
+        try:
+            await upsert_lead(conn, message, source="telegram")
+        except Exception:
+            logger.exception("DB upsert failed on text")
+
+        txt = (message.text or "").strip().lower()
+        if txt in {"преза", "презентация", "файл", "материалы", "финмодель", "модель"}:
+            await send_assets(message)
+            return
+
+        await message.answer("Напиши «презентация» или «финмодель» — пришлю файлы. Или нажми /start.")
+
+    try:
+        logger.info("Bot polling started")
+        await dp.start_polling(bot)
+    finally:
+        await conn.close()
 
 
 if name == "__main__":
