@@ -1,121 +1,113 @@
-exception("Failed to send finmodel: %s", e)
+FSInputFile(str(DECK_PATH)),
+        caption="📎 Презентация франшизы (deck_main.pdf)",
+    )
 
-if not sent_any:
-        await message.answer(
-            "Не нашла файлы в репозитории. Проверь пути:\n"
-            "knowledge/assets/deck_main.pdf\n"
-            "knowledge/assets/financial_model.xlsx"
-        )
+    # XLSX finmodel
+    await message.answer_document(
+        FSInputFile(str(FINMODEL_PATH)),
+        caption="📎 Финмодель (financial_model.xlsx)",
+    )
+
+    await set_sent_assets(pool, user_id, True)
 
 
+# -----------------------
+# HANDLERS
+# -----------------------
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    await db_upsert_lead(message)
-    await db_save_message(message.from_user.id, "user", "/start")
-
-    # 1) сразу ценность — файлы
+async def cmd_start(message: Message, bot: Bot) -> None:
     await message.answer(
-        "Привет! Я помогу быстро разобраться по франшизе.\n"
-        "Сейчас отправлю презентацию и финмодель, а потом коротко уточню пару моментов."
+        "Привет! Я помогу разобраться с франшизой CHI-CHI.\n"
+        "Можешь написать город/бюджет/сроки — я подскажу по формату и шагам запуска."
     )
-    await send_assets_if_exist(message)
-
-    # 2) короткая первичка (без навязчивого созвона)
-    text = (
-        "Чтобы дать максимально полезный расклад под тебя, уточню 2 вещи:\n"
-        "1) В каком городе планируешь запуск?\n"
-        "2) Какой ориентир по стартовому бюджету (примерно)?\n\n"
-        "Можешь ответить одной строкой 🙂"
-    )
-    await message.answer(text)
-    await db_save_message(message.from_user.id, "assistant", text)
 
 
-@router.message(Command("files"))
-async def cmd_files(message: Message) -> None:
-    await db_upsert_lead(message)
-    await send_assets_if_exist(message)
-
-
-@router.message(Command("ping"))
-async def cmd_ping(message: Message) -> None:
-    await message.answer("pong ✅")
+@router.message(Command("reset"))
+async def cmd_reset(message: Message, pool: asyncpg.Pool) -> None:
+    # Сброс флага, чтобы снова отправить материалы
+    await set_sent_assets(pool, message.from_user.id, False)
+    await message.answer("Сбросил. Теперь при следующем сообщении снова отправлю материалы.")
 
 
 @router.message(F.text)
-async def handle_text(message: Message) -> None:
-    await db_upsert_lead(message)
+async def handle_text(message: Message, pool: asyncpg.Pool, openai_client: Optional["AsyncOpenAI"]) -> None:
+    # 1) отправляем материалы один раз
+    await send_assets_if_needed(message, pool)
 
-    user_text = (message.text or "").strip()
-    await db_save_message(message.from_user.id, "user", user_text)
-
-    # Быстрые команды по смыслу
-    lowered = user_text.lower()
-    if any(k in lowered for k in ["през", "презентац", "дек", "deck", "файл", "финмод", "фин модель", "excel", "xlsx"]):
-        await message.answer("Отправляю файлы 👇")
-        await send_assets_if_exist(message)
-        await db_save_message(message.from_user.id, "assistant", "Отправляю файлы 👇")
+    text = (message.text or "").strip()
+    if not text:
         return
 
-    # Если OpenAI ключа нет — не молчим, отвечаем шаблоном
-    if not OPENAI_API_KEY:
-        reply = (
-            "Поняла. Чтобы не гадать и дать точный ответ — напиши, пожалуйста:\n"
-            "• город запуска\n"
-            "• бюджет (диапазон)\n"
-            "• есть ли уже помещение/локация?\n\n"
-            "Если удобнее — могу скинуть ещё раз файлы: /files"
+    # 2) если OpenAI не подключен — хотя бы не молчим
+    if openai_client is None:
+        await message.answer(
+            "Принял вопрос. (OpenAI сейчас не подключён по ключу/пакету.)\n"
+            "Напиши: город, бюджет на старт и какой формат интересен — я отвечу по структуре."
         )
-        await message.answer(reply)
-        await db_save_message(message.from_user.id, "assistant", reply)
         return
 
-    # OpenAI ответ с контекстом и историей
-    history = await db_get_recent_messages(message.from_user.id, limit=12)
-
-    messages = [{"role": "system", "content": SYSTEM_CONTEXT}]
-    messages.extend(history)
-    # (history уже содержит текущее сообщение user, но оставим как есть)
-
-    ai_reply = await openai_chat(messages)
-    if not ai_reply:
-        ai_reply = (
-            "Я вижу запрос, но сейчас не смогла получить ответ от модели (API/лимиты).\n"
-            "Напиши город и бюджет — я продолжу в ручном режиме, и при необходимости пришлю файлы: /files"
-        )
-
-    await message.answer(ai_reply)
-    await db_save_message(message.from_user.id, "assistant", ai_reply)
+    # 3) отвечаем через LLM
+    try:
+        ans = await ai_answer(openai_client, text)
+        if not ans:
+            ans = "Понял. Уточни, пожалуйста: город и бюджет на запуск — тогда отвечу точнее."
+        await message.answer(ans)
+    except Exception as e:
+        log.exception("OpenAI error: %s", e)
+        await message.answer("Сейчас не смог сформировать ответ (ошибка AI). Попробуй ещё раз через минуту.")
 
 
-# =========================
+# -----------------------
 # MAIN
-# =========================
+# -----------------------
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
+
+    # DB pool (optional but recommended)
+    pool: Optional[asyncpg.Pool] = None
+    if DATABASE_URL:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        await init_db(pool)
+        log.info("DB connected ✅")
+    else:
+        log.warning("DATABASE_URL is empty — DB features disabled (assets will re-send each time).")
 
     bot = Bot(
         token=TELEGRAM_BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    # Удаляем webhook на всякий случай, чтобы polling работал
+    # IMPORTANT: remove webhook to avoid getUpdates конфликтов
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted (if existed).")
+        log.info("Webhook deleted ✅")
     except Exception as e:
-        logger.warning("delete_webhook failed (can ignore): %s", e)
-
-    # DB + advisory lock (чтобы не было конфликтов getUpdates)
-    await db_init()
+        log.warning("delete_webhook failed: %s", e)
 
     dp = Dispatcher()
     dp.include_router(router)
 
-    logger.info("BOT STARTED ✅")
-    await dp.start_polling(bot)
+    # OpenAI client (optional)
+    openai_client = build_openai_client()
+    if openai_client:
+        log.info("OpenAI client ready ✅ (%s)", OPENAI_MODEL)
+    else:
+        log.warning("OpenAI disabled (no OPENAI_API_KEY or package missing).")
+
+    # inject dependencies
+    dp["pool"] = pool  # type: ignore
+    dp["openai_client"] = openai_client  # type: ignore
+
+    # wrappers to pass deps into handlers
+    # aiogram v3 gets them from dp context by parameter names
+    log.info("BOT STARTED ✅")
+    await dp.start_polling(bot, pool=pool, openai_client=openai_client)
+
+    # cleanup
+    if pool:
+        await pool.close()
 
 
-if __name__ == "__main__":
+if name == "__main__":
     asyncio.run(main())
