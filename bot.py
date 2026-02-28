@@ -1,60 +1,86 @@
-# не спамим ошибкой, просто молча не отправляем
-        pass
+import asyncio
+import logging
+import os
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.types import Message, FSInputFile
+from aiogram.client.default import DefaultBotProperties
+
+# ---------- LOGGING ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("bot")
+
+# ---------- CONFIG ----------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+
+# Путь к презентации в репозитории
+PRESENTATION_PATH = os.getenv("PRESENTATION_PATH", "knowledge/assets/presentation.pdf")
 
 
-@dp.message(F.text)
-async def any_text(message: Message) -> None:
-    user = message.from_user
-    user_text = message.text.strip()
+# ---------- ROUTER ----------
+router = Router()
 
-    await db_log_message(user.id, user.username, message.chat.id, "user", user_text)
 
-    # Минимальная “первая польза”, чтобы бот не выглядел пустым
-    reply = (
-        "Понял. Чтобы точнее сориентировать по франшизе:\n"
-        "1) Город/район?\n"
-        "2) Планируешь запуск в ТЦ или стрит-ритейл?\n"
-        "3) Примерный бюджет и срок запуска?\n\n"
-        "Можешь ответить в одном сообщении."
+@router.message(F.text.in_({"/start", "start"}))
+async def cmd_start(message: Message):
+    text = (
+        "Привет! Я бот франшизы CHI-CHI.\n\n"
+        "Могу:\n"
+        "1) Отправить презентацию (напиши: <b>презентация</b>)\n"
+        "2) Ответить на вопросы по франшизе (напиши вопрос текстом)\n"
     )
-    await message.answer(reply)
-    await db_log_message(user.id, user.username, message.chat.id, "assistant", reply)
+    await message.answer(text)
 
 
-# =========================
-# MAIN
-# =========================
-async def main() -> None:
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is not set in Railway Variables")
-
-    logging.basicConfig(level=logging.INFO)
-    print("BOOT ✅ starting...", flush=True)
-
-    await db_init()
-
-    # ВАЖНО: single instance guard через Postgres
-    locked = await acquire_single_instance_lock()
-    if not locked:
-        print("Another instance is already running (advisory lock). Exiting to avoid conflict.", flush=True)
-        await db_close()
+@router.message(F.text.lower().contains("презентац"))
+async def send_presentation(message: Message):
+    file_path = Path(PRESENTATION_PATH)
+    if not file_path.exists():
+        await message.answer(
+            "Похоже, файл презентации не найден на сервере.\n"
+            f"Я ищу тут: <code>{file_path.as_posix()}</code>\n\n"
+            "Проверь, что ты закоммитил файл в репозиторий по этому пути "
+            "или укажи переменную PRESENTATION_PATH."
+        )
         return
 
-    bot = Bot(
-        token=TELEGRAM_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    await message.answer("Ок, отправляю презентацию 👇")
+    await message.answer_document(FSInputFile(file_path))
+
+
+@router.message()
+async def fallback(message: Message):
+    # Пока простая заглушка: чтобы бот НЕ МОЛЧАЛ никогда
+    await message.answer(
+        "Принял. Напиши слово <b>презентация</b>, чтобы я отправил файл.\n"
+        "Или задай вопрос — отвечу."
     )
 
-    # Удаляем webhook, чтобы polling не конфликтовал
+
+# ---------- MAIN ----------
+async def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("ENV TELEGRAM_BOT_TOKEN is not set")
+
+    bot = Bot(
+        token=TELEGRAM_BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("BOT STARTED ✅")
+
+    # На всякий случай убираем webhook, чтобы polling точно работал
     await bot.delete_webhook(drop_pending_updates=True)
 
-    print("BOT STARTED ✅ polling", flush=True)
-    try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        print("SHUTDOWN... releasing lock and closing DB", flush=True)
-        await release_single_instance_lock()
-        await db_close()
+    # ВАЖНО: allowed_updates можно оставить None (по умолчанию всё)
+    await dp.start_polling(bot)
 
 
 if name == "__main__":
