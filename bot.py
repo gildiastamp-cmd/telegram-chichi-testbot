@@ -1,453 +1,481 @@
-# bot.py
-# AIra (ИИра) — Telegram sales bot for franchise leads
-# Safe-by-default: minimal moving parts, clear handlers, no fragile magic.
-#
-# Requirements (examples):
-# aiogram==3.*
-# asyncpg==0.29.*
-# python-dotenv==1.*   (optional)
-#
-# ENV needed:
-# BOT_TOKEN=...
-# DATABASE_URL=postgresql://user:pass@host:port/dbname
-#
-# Optional ENV:
-# ADMIN_CHAT_ID=123456789   (to forward "book_call" / "calc_model" requests)
-# AMO_BASE_URL=https://...  (optional, if you later add amoCRM)
-# AMO_ACCESS_TOKEN=...      (optional, if you later add amoCRM)
-
-import os
 import asyncio
+import json
 import logging
+import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Any, Dict
 
 import asyncpg
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile,
-)
-from aiogram.fsm.state import State, StatesGroup
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# -----------------------------
+
+# -------------------------
 # Config
-# -----------------------------
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+
 
 @dataclass
 class Config:
     bot_token: str
     database_url: str
-    admin_chat_id: Optional[int] = None
-
-    # assets (relative paths inside repo)
-    deck_path: str = "knowledge/assets/deck_main.pdf"
-    fin_model_path: str = "knowledge/assets/financial_model.xlsx"
+    assets_dir: str = "assets"
+    deck_filename: str = "deck_main.pdf"
+    finmodel_filename: str = "financial_model.xlsx"
+    call_link: str = ""
+    # amoCRM (optional; stub-safe)
+    amo_base_url: str = ""
+    amo_access_token: str = ""
+    amo_pipeline_id: str = ""
+    amo_status_id: str = ""
 
 
 def load_config() -> Config:
-    token = os.getenv("BOT_TOKEN", "").strip()
-    db = os.getenv("DATABASE_URL", "").strip()
-    admin = os.getenv("ADMIN_CHAT_ID", "").strip()
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not bot_token:
+        raise RuntimeError("BOT_TOKEN is missing")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is missing")
 
-    if not token:
-        raise RuntimeError("BOT_TOKEN is not set")
-    if not db:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    admin_chat_id = int(admin) if admin.isdigit() else None
-    return Config(bot_token=token, database_url=db, admin_chat_id=admin_chat_id)
-
-
-# -----------------------------
-# Logging
-# -----------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("aiira-bot")
+    return Config(
+        bot_token=bot_token,
+        database_url=database_url,
+        assets_dir=os.getenv("ASSETS_DIR", "assets").strip() or "assets",
+        deck_filename=os.getenv("DECK_FILE", "deck_main.pdf").strip() or "deck_main.pdf",
+        finmodel_filename=os.getenv("FINMODEL_FILE", "financial_model.xlsx").strip() or "financial_model.xlsx",
+        call_link=os.getenv("CALL_LINK", "").strip(),
+        amo_base_url=os.getenv("AMO_BASE_URL", "").strip(),
+        amo_access_token=os.getenv("AMO_ACCESS_TOKEN", "").strip(),
+        amo_pipeline_id=os.getenv("AMO_PIPELINE_ID", "").strip(),
+        amo_status_id=os.getenv("AMO_STATUS_ID", "").strip(),
+    )
 
 
-# -----------------------------
+# -------------------------
 # DB
-# -----------------------------
+# -------------------------
+class DB:
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
 
-CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS leads (
-    id BIGSERIAL PRIMARY KEY,
-    tg_user_id BIGINT NOT NULL,
-    tg_username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    last_action TEXT DEFAULT NULL,
-    payload JSONB DEFAULT '{}'::jsonb
-);
-CREATE INDEX IF NOT EXISTS idx_leads_user_id ON leads (tg_user_id);
-"""
+    @classmethod
+    async def create(cls, dsn: str) -> "DB":
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+        db = cls(pool)
+        await db.ensure_schema()
+        return db
 
-UPSERT_LEAD_SQL = """
-INSERT INTO leads (tg_user_id, tg_username, first_name, last_name, last_action, payload)
-VALUES ($1, $2, $3, $4, $5, COALESCE($6, '{}'::jsonb))
-ON CONFLICT (tg_user_id) DO UPDATE SET
-  tg_username = EXCLUDED.tg_username,
-  first_name = EXCLUDED.first_name,
-  last_name = EXCLUDED.last_name,
-  last_action = EXCLUDED.last_action,
-  payload = leads.payload || EXCLUDED.payload;
-"""
+    async def ensure_schema(self) -> None:
+        """
+        'Не навреди': если таблица уже существует - НЕ трогаем данные,
+        только добавляем недостающие колонки и индексы.
+        """
+        async with self.pool.acquire() as conn:
+            # 1) create table if not exists (minimal)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS leads (
+                    id BIGSERIAL PRIMARY KEY
+                );
+                """
+            )
 
-# NOTE: For ON CONFLICT(tg_user_id) we need UNIQUE constraint on tg_user_id.
-# We'll ensure it in init below.
+            # 2) add columns if missing
+            # NOTE: ADD COLUMN IF NOT EXISTS works on modern Postgres (Railway обычно ок)
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS username TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS first_name TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_name TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS language_code TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS city TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS phone TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS source TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS stage TEXT;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS state JSONB;""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();""")
+            await conn.execute("""ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW();""")
 
-ENSURE_UNIQUE_SQL = """
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'leads_tg_user_id_unique'
-    ) THEN
-        ALTER TABLE leads ADD CONSTRAINT leads_tg_user_id_unique UNIQUE (tg_user_id);
-    END IF;
-END $$;
-"""
+            # 3) indexes (safe)await conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS leads_tg_user_id_uidx ON leads(tg_user_id);"""
+            )
+            await conn.execute(
+                """CREATE INDEX IF NOT EXISTS leads_last_seen_idx ON leads(last_seen_at);"""
+            )
+
+        log.info("DB schema ensured (self-healing migrations applied).")
+
+    async def upsert_lead(self, user: types.User, source: str = "telegram") -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO leads (tg_user_id, username, first_name, last_name, language_code, source, last_seen_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT (tg_user_id)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    language_code = EXCLUDED.language_code,
+                    source = EXCLUDED.source,
+                    last_seen_at = NOW();
+                """,
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.language_code,
+                source,
+            )
+
+    async def set_stage(self, tg_user_id: int, stage: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE leads
+                SET stage = $2, last_seen_at = NOW()
+                WHERE tg_user_id = $1;
+                """,
+                tg_user_id,
+                stage,
+            )
+
+    async def set_city(self, tg_user_id: int, city: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE leads SET city = $2, last_seen_at = NOW() WHERE tg_user_id = $1;""",
+                tg_user_id, city
+            )
+
+    async def set_state(self, tg_user_id: int, data: Dict[str, Any]) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE leads SET state = $2::jsonb, last_seen_at = NOW() WHERE tg_user_id = $1;""",
+                tg_user_id, json.dumps(data, ensure_ascii=False)
+            )
 
 
-async def init_db(pool: asyncpg.Pool) -> None:
-    async with pool.acquire() as conn:
-        await conn.execute(CREATE_TABLE_SQL)
-        await conn.execute(ENSURE_UNIQUE_SQL)
-    log.info("DB initialized")
+# -------------------------
+# Persona / UI
+# -------------------------
+IRA_NAME = "ИИра"
+
+IRA_PERSONA = (
+    f"Я {IRA_NAME} — личная ИИ-ассистентка Дмитрия Родионова.\n"
+    "Я люблю ясность, быстрые решения и честные цифры. "
+    "Из моих странностей — коллекционирую фотки луны над водой и умею вежливо дожимать до созвона 😌"
+)
+
+def main_menu_kb() -> types.InlineKeyboardMarkup:
+    kb = [
+        [types.InlineKeyboardButton(text="📄 Получить презентацию", callback_data="get_deck")],
+        [types.InlineKeyboardButton(text="📊 Получить фин. модель", callback_data="get_finmodel")],
+        [types.InlineKeyboardButton(text="🧮 Рассчитать персональную фин. модель", callback_data="calc_model")],
+        [types.InlineKeyboardButton(text="📞 Назначить созвон с Дмитрием", callback_data="book_call")],
+        [types.InlineKeyboardButton(text="✨ Чем вы лучше? (кратко)", callback_data="about")],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-async def upsert_lead(
-    pool: asyncpg.Pool,
-    message: Message,
-    last_action: str,
-    payload: Optional[Dict[str, Any]] = None,
-) -> None:
-    user = message.from_user
-    if not user:
-        return
-
-    data = payload or {}
-    async with pool.acquire() as conn:
-        await conn.execute(
-            UPSERT_LEAD_SQL,
-            user.id,
-            user.username,
-            user.first_name,
-            user.last_name,
-            last_action,
-            data,
-        )
+def back_to_menu_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[[types.InlineKeyboardButton(text="↩️ В меню", callback_data="menu")]]
+    )
 
 
-# -----------------------------
-# UI (Buttons)
-# -----------------------------
-
-def main_menu() -> InlineKeyboardMarkup:return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Получить презентацию", callback_data="get_presentation")],
-        [InlineKeyboardButton(text="📊 Получить фин. модель", callback_data="get_finmodel")],
-        [InlineKeyboardButton(text="🧮 Рассчитать персональную фин. модель", callback_data="calc_model")],
-        [InlineKeyboardButton(text="📞 Назначить созвон", callback_data="book_call")],
-    ])
+# -------------------------
+# FSM (calc)
+# -------------------------
+class CalcFSM(StatesGroup):
+    city = State()
+    investment = State()
+    format = State()
 
 
-# -----------------------------
-# FSM (for safe step-by-step)
-# -----------------------------
+# -------------------------
+# amoCRM (safe stub)
+# -------------------------
+async def send_to_amocrm_stub(cfg: Config, lead: Dict[str, Any]) -> None:
+    """
+    Безопасно: если amo env не заданы — просто логируем и выходим.
+    Реальную интеграцию включим позже, не ломая работающий бот.
+    """
+    if not (cfg.amo_base_url and cfg.amo_access_token):
+        log.info("amoCRM env not set -> skip integration (stub).")
+        return# Здесь будет реальный запрос (httpx/aiohttp) — добавим, когда ты скажешь.
+    # Сейчас intentionally no-op to avoid breaking production.
+    log.info("amoCRM stub: would send lead=%s", lead)
 
-class CalcModelFlow(StatesGroup):
-    waiting_input = State()
 
-
-class BookCallFlow(StatesGroup):
-    waiting_input = State()
-
-
-# -----------------------------
-# Router
-# -----------------------------
-
+# -------------------------
+# Bot handlers
+# -------------------------
 router = Router()
 
-# Will be set in main()
-DB_POOL: Optional[asyncpg.Pool] = None
-CFG: Optional[Config] = None
+def assets_path(cfg: Config, filename: str) -> str:
+    return os.path.join(cfg.assets_dir, filename)
 
-
-# -----------------------------
-# Helpers
-# -----------------------------
-
-async def safe_answer(callback: CallbackQuery) -> None:
-    # Telegram sometimes complains if we don't answer callback quickly
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-
-def aiira_intro() -> str:
-    return (
-        "Привет 💫 Я ИИра — личный ИИ-ассистент Дмитрия Родионова.\n"
-        "Помогаю быстро разобраться во франшизе и подобрать лучший путь к запуску.\n\n"
-        "Выбери, с чего начнём 👇"
-    )
-
-
-def not_found_asset_text(path: str) -> str:
-    return (
-        "Похоже, файл сейчас недоступен 😕\n"
-        f"Проверь, что он лежит по пути:\n{path}\n"
-        "и задеплой заново."
-    )
-
-
-async def send_admin_notification(bot: Bot, text: str) -> None:
-    if not CFG or not CFG.admin_chat_id:
+async def send_file_if_exists(message_or_cb: Any, cfg: Config, filename: str, caption: str) -> None:
+    path = assets_path(cfg, filename)
+    if not os.path.exists(path):
+        text = (
+            f"Упс. Файл не найден на сервере: {path}.\n"
+            f"Проверь, что он лежит в репо и деплоится в Railway."
+        )
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.message.answer(text, parse_mode="Markdown", reply_markup=back_to_menu_kb())
+            await message_or_cb.answer()
+        else:
+            await message_or_cb.answer(text, parse_mode="Markdown", reply_markup=back_to_menu_kb())
         return
-    try:
-        await bot.send_message(CFG.admin_chat_id, text)
-    except Exception as e:
-        log.warning("Failed to notify admin: %s", e)
 
+    doc = types.FSInputFile(path)
+    if isinstance(message_or_cb, types.CallbackQuery):
+        await message_or_cb.message.answer_document(document=doc, caption=caption)
+        await message_or_cb.answer()
+    else:
+        await message_or_cb.answer_document(document=doc, caption=caption)
 
-# -----------------------------
-# Handlers
-# -----------------------------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    cfg: Config = message.bot["cfg"]
+    db: DB = message.bot["db"]
+
     await state.clear()
+    await db.upsert_lead(message.from_user)
+    await db.set_stage(message.from_user.id, "start")
 
-    if DB_POOL:
-        await upsert_lead(DB_POOL, message, last_action="start", payload={"event": "start"})
-
-    await message.answer(aiira_intro(), reply_markup=main_menu())
-
-
-@router.callback_query(F.data == "get_presentation")
-async def cb_presentation(callback: CallbackQuery) -> None:
-    await safe_answer(callback)
-    if not callback.message:
-        return
-
-    msg = callback.message
-    bot = msg.bot
-
-    if DB_POOL:
-        await upsert_lead(DB_POOL, msg, last_action="get_presentation", payload={"event": "get_presentation"})
-
-    assert CFG is not None
-    if not os.path.exists(CFG.deck_path):
-        await msg.answer(not_found_asset_text(CFG.deck_path))
-        return
-
-    await msg.answer("Держи материалы 👇")
-    await msg.answer_document(
-        FSInputFile(CFG.deck_path),
-        caption="📄 Презентация франшизы (deck_main.pdf)",
+    text = (
+        f"Привет! Я {IRA_NAME} 👋\n\n"
+        f"{IRA_PERSONA}\n\n"
+        "Чтобы не тратить время — выбери, что прислать или что сделать:"
     )
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "menu")
+async def cb_menu(cb: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await cb.message.answer("Меню 👇", reply_markup=main_menu_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "get_deck")
+async def cb_deck(cb: types.CallbackQuery) -> None:
+    cfg: Config = cb.bot["cfg"]
+    db: DB = cb.bot["db"]
+
+    await db.upsert_lead(cb.from_user)
+    await db.set_stage(cb.from_user.id, "sent_deck")
+
+    await cb.message.answer("Держи материалы 👇")
+    await send_file_if_exists(cb, cfg, cfg.deck_filename, f"Презентация франшизы ({cfg.deck_filename})")
 
 
 @router.callback_query(F.data == "get_finmodel")
-async def cb_finmodel(callback: CallbackQuery) -> None:
-    await safe_answer(callback)
-    if not callback.message:
-        return
+async def cb_finmodel(cb: types.CallbackQuery) -> None:
+    cfg: Config = cb.bot["cfg"]
+    db: DB = cb.bot["db"]
 
-    msg = callback.message
+    await db.upsert_lead(cb.from_user)
+    await db.set_stage(cb.from_user.id, "sent_finmodel")
 
-    if DB_POOL:
-        await upsert_lead(DB_POOL, msg, last_action="get_finmodel", payload={"event": "get_finmodel"})
+    await cb.message.answer("Лови 👇")
+    await send_file_if_exists(cb, cfg, cfg.finmodel_filename, f"Финансовая модель ({cfg.finmodel_filename})")
 
-    assert CFG is not None
-    if not os.path.exists(CFG.fin_model_path):
-        await msg.answer(not_found_asset_text(CFG.fin_model_path))
-        return
 
-    await msg.answer_document(
-        FSInputFile(CFG.fin_model_path),
-        caption="📊 Финансовая модель (financial_model.xlsx)",
+@router.callback_query(F.data == "about")
+async def cb_about(cb: types.CallbackQuery) -> None:
+    db: DB = cb.bot["db"]
+    await db.upsert_lead(cb.from_user)
+    await db.set_stage(cb.from_user.id, "about")
+
+    text = (
+        "Коротко и по делу:\n"
+        "• Помогаем быстро выйти на понятную окупаемость (цифры — в финмодели).\n"
+        "• Даем проверенные процессы: от запуска до стабильных продаж.\n"
+        "• Сильная поддержка и контроль качества.\n\n"
+        "Хочешь — скажи город и бюджет, я прикину реалистичный сценарий и предложу лучший следующий шаг."
     )
-
-
-@router.callback_query(F.data == "calc_model")
-async def cb_calc_model(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
-    if not callback.message:
-        return
-
-    msg = callback.message
-
-    if DB_POOL:
-        await upsert_lead(DB_POOL, msg, last_action="calc_model_clicked", payload={"event": "calc_model_clicked"})
-
-    await state.set_state(CalcModelFlow.waiting_input)
-    await msg.answer(
-        "Ок, рассчитаю персонально 🧮\n\n"
-        "Напиши одним сообщением:\n"
-        "1) Город\n""2) Бюджет (примерно)\n"
-        "3) Есть ли опыт в бизнесе (да/нет)\n"
-        "4) Сколько времени готов уделять (часов в неделю)\n\n"
-        "Можно в свободной форме — я пойму."
-    )
+    await cb.message.answer(text, reply_markup=main_menu_kb())
+    await cb.answer()
 
 
 @router.callback_query(F.data == "book_call")
-async def cb_book_call(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
-    if not callback.message:
-        return
+async def cb_book_call(cb: types.CallbackQuery) -> None:
+    cfg: Config = cb.bot["cfg"]
+    db: DB = cb.bot["db"]
 
-    msg = callback.message
+    await db.upsert_lead(cb.from_user)
+    await db.set_stage(cb.from_user.id, "book_call")
 
-    if DB_POOL:
-        await upsert_lead(DB_POOL, msg, last_action="book_call_clicked", payload={"event": "book_call_clicked"})
+    if cfg.call_link:
+        await cb.message.answer(
+            f"Записаться на созвон с Дмитрием можно тут:\n{cfg.call_link}\n\n"
+            "Если удобнее — напиши 2–3 окна по времени, я подстроюсь.",
+            reply_markup=back_to_menu_kb(),
+        )else:
+        await cb.message.answer(
+            "Ок, давай назначим созвон 👍\n"
+            "Напиши, пожалуйста, 2–3 удобных окна по времени (и часовой пояс).",
+            reply_markup=back_to_menu_kb(),
+        )
+    await cb.answer()
 
-    await state.set_state(BookCallFlow.waiting_input)
-    await msg.answer(
-        "Ок, организую созвон с Дмитрием 📞\n\n"
-        "Напиши:\n"
-        "1) Имя\n"
-        "2) Телефон\n"
-        "3) Удобное время (сегодня/завтра, диапазон)\n"
-        "4) Город/часовой пояс\n\n"
-        "Я передам Дмитрию и подтвержу."
+
+@router.callback_query(F.data == "calc_model")
+async def cb_calc(cb: types.CallbackQuery, state: FSMContext) -> None:
+    db: DB = cb.bot["db"]
+    await db.upsert_lead(cb.from_user)
+    await db.set_stage(cb.from_user.id, "calc_started")
+
+    await state.set_state(CalcFSM.city)
+    await cb.message.answer(
+        "Супер. Сделаем быстрый расчет.\n\n"
+        "1/3 — В каком ты городе (или стране)?",
+        reply_markup=back_to_menu_kb(),
     )
+    await cb.answer()
 
 
-@router.message(CalcModelFlow.waiting_input)
-async def calc_model_collect(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Напиши текстом, пожалуйста 🙂")
-        return
+@router.message(CalcFSM.city)
+async def fsm_city(message: types.Message, state: FSMContext) -> None:
+    db: DB = message.bot["db"]
+    city = (message.text or "").strip()
+    await state.update_data(city=city)
+    await db.set_city(message.from_user.id, city)
+    await db.set_stage(message.from_user.id, "calc_city")
+
+    await state.set_state(CalcFSM.investment)
+    await message.answer("2/3 — Какой ориентир по инвестициям? (можно диапазон)")
+
+
+@router.message(CalcFSM.investment)
+async def fsm_investment(message: types.Message, state: FSMContext) -> None:
+    db: DB = message.bot["db"]
+    inv = (message.text or "").strip()
+    await state.update_data(investment=inv)
+    await db.set_stage(message.from_user.id, "calc_investment")
+
+    await state.set_state(CalcFSM.format)
+    await message.answer("3/3 — Какой формат хочешь? (например: 'с нуля', 'в партнёрстве', 'есть помещение')")
+
+
+@router.message(CalcFSM.format)
+async def fsm_format(message: types.Message, state: FSMContext) -> None:
+    cfg: Config = message.bot["cfg"]
+    db: DB = message.bot["db"]
+
+    fmt = (message.text or "").strip()
+    data = await state.get_data()
+    city = data.get("city", "")
+    inv = data.get("investment", "")
 
     await state.clear()
+    await db.set_stage(message.from_user.id, "calc_done")
+    await db.set_state(message.from_user.id, {"calc": {"city": city, "investment": inv, "format": fmt}})
 
-    if DB_POOL:
-        await upsert_lead(DB_POOL, message, last_action="calc_model_submitted", payload={"calc_request": text})
+    # safe amo stub (does not break)
+    await send_to_amocrm_stub(cfg, {
+        "tg_user_id": message.from_user.id,
+        "username": message.from_user.username,
+        "first_name": message.from_user.first_name,
+        "city": city,
+        "investment": inv,
+        "format": fmt,
+        "stage": "calc_done",
+    })
 
-    await message.answer(
-        "Приняла ✅\n"
-        "Соберу расчёт и вернусь с цифрами.\n\n"
-        "Пока можешь выбрать ещё что-то из меню 👇",
-        reply_markup=main_menu(),
+    reply = (
+        f"Принято ✅\n"
+        f"Город: {city}\n"
+        f"Инвестиции: {inv}\n"
+        f"Формат: {fmt}\n\n"
+        "Дальше честно: лучший рост конверсии дает короткий созвон с Дмитрием — "
+        "он за 10–15 минут скажет, реалистично ли это по цифрам и какой сценарий лучше.\n"
     )
 
-    # Notify admin (optional)
-    await send_admin_notification(
-        message.bot,
-        f"🧮 Calc model request\n"
-        f"User: {message.from_user.id} @{message.from_user.username}\n"
-        f"Text:\n{text}",
-    )
+    if cfg.call_link:
+        reply += f"\nСсылка на запись: {cfg.call_link}"
+    else:
+        reply += "\nНапиши 2–3 удобных окна по времени — я передам Дмитрию."
+
+    await message.answer(reply, reply_markup=main_menu_kb())
 
 
-@router.message(BookCallFlow.waiting_input)
-async def book_call_collect(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Напиши текстом, пожалуйста 🙂")
+# -------------------------
+# Text triggers (non-button)
+# -------------------------
+@router.message(Command("help"))
+async def cmd_help(message: types.Message) -> None:
+    await message.answer("Жми кнопки в меню 👇", reply_markup=main_menu_kb())
+
+
+@router.message(F.text)
+async def any_text(message: types.Message) -> None:
+    cfg: Config = message.bot["cfg"]
+    db: DB = message.bot["db"]
+
+    await db.upsert_lead(message.from_user)
+
+    t = (message.text or "").strip().lower()
+
+    if "презентац" in t:
+        await db.set_stage(message.from_user.id, "sent_deck_text")
+        await message.answer("Держи материалы 👇")
+        await send_file_if_exists(message, cfg, cfg.deck_filename, f"Презентация франшизы ({cfg.deck_filename})")
+        await message.answer("Если хочешь — могу прикинуть цифры под тебя. Жми «Рассчитать…» 👇", reply_markup=main_menu_kb())
         return
 
-    await state.clear()
-
-    if DB_POOL:
-        await upsert_lead(DB_POOL, message, last_action="book_call_submitted", payload={"call_request": text})
-
-    await message.answer(
-        "Приняла ✅\n"
-        "Передаю Дмитрию. Он подтвердит время созвона.\n\n"
-        "Если хочешь, могу параллельно скинуть материалы или финмодель 👇",
-        reply_markup=main_menu(),
-    )
-
-    await send_admin_notification(
-        message.bot,
-        f"📞 Call request\n"
-        f"User: {message.from_user.id} @{message.from_user.username}\n"
-        f"Text:\n{text}",
-    )
-
-
-@router.message()
-async def fallback_message(message: Message) -> None:
-    """
-    Safe fallback:
-    - If user types keywords: "презентация" or "финмодель", send files.
-    - Otherwise show menu + short helpful line.
-    """
-    txt = (message.text or "").strip().lower()
-
-    if not txt:
-        await message.answer("Выбери кнопку в меню 👇", reply_markup=main_menu())
+    if "финмодел" in t or "фин модель" in t or "фин. модель" in t:
+        await db.set_stage(message.from_user.id, "sent_finmodel_text")
+        await message.answer("Лови 👇")await send_file_if_exists(message, cfg, cfg.finmodel_filename, f"Финансовая модель ({cfg.finmodel_filename})")
+        await message.answer("Хочешь персональный расчет? Жми «Рассчитать…» 👇", reply_markup=main_menu_kb())
         return
 
-    # Keyword shortcuts (keep backwards compatibility)
-    if "през" in txt:
-        assert CFG is not None
-        if os.path.exists(CFG.deck_path):
-            if DB_POOL:
-                await upsert_lead(DB_POOL, message, last_action="keyword_presentation", payload={"event": "keyword_presentation"})
-            await message.answer_document(FSInputFile(CFG.deck_path), caption="📄 Презентация франшизы (deck_main.pdf)")
+    if "созвон" in t or "звон" in t or "call" in t:
+        await db.set_stage(message.from_user.id, "book_call_text")
+        if cfg.call_link:
+            await message.answer(f"Запись на созвон с Дмитрием:\n{cfg.call_link}", reply_markup=main_menu_kb())
         else:
-            await message.answer(not_found_asset_text(CFG.deck_path))
+            await message.answer("Ок. Напиши 2–3 удобных окна по времени (и часовой пояс).", reply_markup=main_menu_kb())
         return
 
-    if "фин" in txt:
-        assert CFG is not None
-        if os.path.exists(CFG.fin_model_path):
-            if DB_POOL:
-                await upsert_lead(DB_POOL, message, last_action="keyword_finmodel", payload={"event": "keyword_finmodel"})
-            await message.answer_document(FSInputFile(CFG.fin_model_path), caption="📊 Финансовая модель (financial_model.xlsx)")
-        else:
-            await message.answer(not_found_asset_text(CFG.fin_model_path))
-        return
-
-    # Light "Apple-style" assistant move: one clarifying question + menu
-    if DB_POOL:await upsert_lead(DB_POOL, message, last_action="free_text", payload={"message": message.text})
-
+    # default: keep bot "alive" and guide
+    await db.set_stage(message.from_user.id, "chat")
     await message.answer(
-        "Поняла. Чтобы помочь точнее — что сейчас важнее: быстрее стартовать или уложиться в бюджет?\n\n"
-        "А ещё можно выбрать действие в меню 👇",
-        reply_markup=main_menu(),
+        f"Я на связи 😊\n"
+        f"Проще всего — выбрать действие кнопкой ниже.\n"
+        f"Если хочешь, напиши: город + бюджет — и я предложу самый реалистичный следующий шаг.",
+        reply_markup=main_menu_kb(),
     )
 
 
-# -----------------------------
-# Main
-# -----------------------------
-
+# -------------------------
+# App entry
+# -------------------------
 async def main() -> None:
-    global DB_POOL, CFG
+    cfg = load_config()
 
-    CFG = load_config()
+    bot = Bot(token=cfg.bot_token)
+    dp = Dispatcher(storage=MemoryStorage())
 
-    DB_POOL = await asyncpg.create_pool(CFG.database_url, min_size=1, max_size=5)
-    await init_db(DB_POOL)
+    db = await DB.create(cfg.database_url)
 
-    bot = Bot(token=CFG.bot_token)
-    dp = Dispatcher()
+    bot["cfg"] = cfg
+    bot["db"] = db
+
     dp.include_router(router)
 
-    log.info("Bot started")
+    log.info("Bot starting polling...")
     await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+if name == "__main__":
+    asyncio.run(main())
