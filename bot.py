@@ -142,7 +142,7 @@ async def db_init_schema() -> None:
         phone_or_contact TEXT,
         calc_payload    JSONB
     );
-    """create_index = """
+    create_index = """
     CREATE UNIQUE INDEX IF NOT EXISTS leads_tg_user_id_uidx
     ON leads (tg_user_id);
     """
